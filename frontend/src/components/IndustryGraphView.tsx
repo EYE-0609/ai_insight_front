@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import CytoscapeComponent from "react-cytoscapejs";
 import type { Core, ElementDefinition, EventObject } from "cytoscape";
 
@@ -37,6 +37,23 @@ type SelectedItem =
   | { kind: "node"; id: string; label: string; nodeType: string }
   | { kind: "edge"; relation: Relation };
 
+type NodePosition = { x: number; y: number };
+type ProfilePositionCache = Record<string, Record<string, NodePosition>>;
+
+const graphLayout = {
+  name: "cose",
+  animate: false,
+  fit: true,
+  padding: 64,
+  nodeRepulsion: 9000,
+  idealEdgeLength: 150,
+  edgeElasticity: 120,
+  nestingFactor: 1.2,
+  gravity: 0.12,
+  numIter: 1200,
+  randomize: true,
+};
+
 const nodeLabel = (id: string, nodesById: Record<string, GraphNode>) =>
   nodesById[id]?.name || id.split(":").slice(1).join(":") || id;
 
@@ -57,12 +74,13 @@ function buildNodeIndex(graphPayload?: GraphPayload) {
   return nodesById;
 }
 
-function buildElements(graphPayload: GraphPayload | undefined, expandedCompanyId: string | null) {
+function buildElements(graphPayload: GraphPayload | undefined, expandedCompanyIds: string[]) {
   const nodesById = buildNodeIndex(graphPayload);
   const companyEdges = graphPayload?.company_edges || [];
-  const profileEdges = expandedCompanyId
+  const expandedCompanies = new Set(expandedCompanyIds);
+  const profileEdges = expandedCompanies.size
     ? (graphPayload?.profile_edges || []).filter(
-        (relation) => relation.head === expandedCompanyId || relation.tail === expandedCompanyId,
+        (relation) => expandedCompanies.has(relation.head) || expandedCompanies.has(relation.tail),
       )
     : [];
   const visibleRelations = [...companyEdges, ...profileEdges];
@@ -102,6 +120,93 @@ function buildElements(graphPayload: GraphPayload | undefined, expandedCompanyId
   return { elements, visibleRelations };
 }
 
+function stableJitter(seed: string, range: number) {
+  let hash = 0;
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) % 9973;
+  }
+  return ((hash / 9973) * 2 - 1) * range;
+}
+
+function profileBaseAngle(type: string, index: number) {
+  const normalizedType = type.toLowerCase();
+  if (normalizedType === "businessline") return -Math.PI * 0.68 + index * 0.22;
+  if (normalizedType === "product") return Math.PI * 0.36 + index * 0.2;
+  if (normalizedType === "technology") return -Math.PI * 0.18 + index * 0.2;
+  return -Math.PI / 2 + index * 0.35;
+}
+
+function connectedProfileNodeIds(graphPayload: GraphPayload | undefined, companyId: string) {
+  const profileEdges = graphPayload?.profile_edges || [];
+  return Array.from(
+    new Set(
+      profileEdges
+        .filter((relation) => relation.head === companyId || relation.tail === companyId)
+        .map((relation) => (relation.head === companyId ? relation.tail : relation.head)),
+    ),
+  );
+}
+
+function saveProfileNodePositions(
+  cy: Core,
+  graphPayload: GraphPayload | undefined,
+  companyId: string,
+  positionCache: ProfilePositionCache,
+) {
+  const nextPositions: Record<string, NodePosition> = {};
+  for (const nodeId of connectedProfileNodeIds(graphPayload, companyId)) {
+    const node = cy.getElementById(nodeId);
+    if (node.length) {
+      const position = node.position();
+      nextPositions[nodeId] = { x: position.x, y: position.y };
+    }
+  }
+
+  if (Object.keys(nextPositions).length) {
+    positionCache[companyId] = nextPositions;
+  }
+}
+
+function arrangeProfileNodes(
+  cy: Core,
+  graphPayload: GraphPayload | undefined,
+  expandedCompanyIds: string[],
+  positionCache: ProfilePositionCache,
+) {
+  const nodesById = buildNodeIndex(graphPayload);
+
+  for (const companyId of expandedCompanyIds) {
+    const companyNode = cy.getElementById(companyId);
+    if (!companyNode.length) continue;
+
+    const connectedProfileIds = connectedProfileNodeIds(graphPayload, companyId).filter(
+      (nodeId) => cy.getElementById(nodeId).length,
+    );
+
+    const center = companyNode.position();
+    const typeCounts: Record<string, number> = {};
+
+    connectedProfileIds.forEach((nodeId, index) => {
+      const cachedPosition = positionCache[companyId]?.[nodeId];
+      if (cachedPosition) {
+        cy.getElementById(nodeId).position(cachedPosition);
+        return;
+      }
+
+      const type = nodeType(nodeId, nodesById);
+      const typeIndex = typeCounts[type] || 0;
+      typeCounts[type] = typeIndex + 1;
+      const angle = profileBaseAngle(type, typeIndex) + stableJitter(`${companyId}:${nodeId}:angle`, 0.16);
+      const radius = 138 + index * 14 + stableJitter(`${companyId}:${nodeId}:radius`, 18);
+
+      cy.getElementById(nodeId).position({
+        x: center.x + Math.cos(angle) * radius,
+        y: center.y + Math.sin(angle) * radius,
+      });
+    });
+  }
+}
+
 export default function IndustryGraphView({
   graphPayload,
   selectedCompanyName,
@@ -113,14 +218,15 @@ export default function IndustryGraphView({
   onSelectCompany?: (name: string) => void;
   showDetails?: boolean;
 }) {
-  const [expandedCompanyId, setExpandedCompanyId] = useState<string | null>(null);
+  const [expandedCompanyIds, setExpandedCompanyIds] = useState<string[]>([]);
   const [selectedItem, setSelectedItem] = useState<SelectedItem | null>(null);
   const [cyInstance, setCyInstance] = useState<Core | null>(null);
+  const profilePositionCache = useRef<ProfilePositionCache>({});
 
   const nodesById = useMemo(() => buildNodeIndex(graphPayload), [graphPayload]);
   const { elements } = useMemo(
-    () => buildElements(graphPayload, expandedCompanyId),
-    [graphPayload, expandedCompanyId],
+    () => buildElements(graphPayload, expandedCompanyIds),
+    [graphPayload, expandedCompanyIds],
   );
   const companyEdges = graphPayload?.company_edges || [];
   const profileEdges = graphPayload?.profile_edges || [];
@@ -129,7 +235,6 @@ export default function IndustryGraphView({
     if (!selectedCompanyName) return;
     const selectedId = `company:${selectedCompanyName}`;
     if (nodesById[selectedId]) {
-      setExpandedCompanyId(selectedId);
       setSelectedItem({
         kind: "node",
         id: selectedId,
@@ -143,14 +248,20 @@ export default function IndustryGraphView({
     if (!cyInstance) return;
 
     const effectNodesById = buildNodeIndex(graphPayload);
-    const { visibleRelations } = buildElements(graphPayload, expandedCompanyId);
+    const { visibleRelations } = buildElements(graphPayload, expandedCompanyIds);
 
     const handleNodeTap = (event: EventObject) => {
       const id = String(event.target.id());
       const type = nodeType(id, effectNodesById);
       setSelectedItem({ kind: "node", id, label: nodeLabel(id, effectNodesById), nodeType: type });
       if (type === "Company") {
-        setExpandedCompanyId((current) => (current === id ? null : id));
+        setExpandedCompanyIds((current) => {
+          if (current.includes(id)) {
+            saveProfileNodePositions(cyInstance, graphPayload, id, profilePositionCache.current);
+            return current.filter((companyId) => companyId !== id);
+          }
+          return [...current, id];
+        });
         onSelectCompany?.(nodeLabel(id, effectNodesById));
       }
     };
@@ -169,15 +280,22 @@ export default function IndustryGraphView({
       cyInstance.removeListener("tap", "node", handleNodeTap);
       cyInstance.removeListener("tap", "edge", handleEdgeTap);
     };
-  }, [cyInstance, graphPayload, expandedCompanyId, onSelectCompany]);
+  }, [cyInstance, graphPayload, expandedCompanyIds, onSelectCompany]);
 
   useEffect(() => {
     if (!cyInstance) return;
     cyInstance.elements().removeClass("expanded");
-    if (expandedCompanyId) {
-      cyInstance.getElementById(expandedCompanyId).addClass("expanded");
+    for (const companyId of expandedCompanyIds) {
+      cyInstance.getElementById(companyId).addClass("expanded");
     }
-  }, [cyInstance, expandedCompanyId, elements]);
+
+    const timeoutId = window.setTimeout(() => {
+      arrangeProfileNodes(cyInstance, graphPayload, expandedCompanyIds, profilePositionCache.current);
+      cyInstance.fit(undefined, 64);
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [cyInstance, graphPayload, expandedCompanyIds, elements]);
 
   if (!graphPayload || companyEdges.length === 0) {
     return (
@@ -212,7 +330,7 @@ export default function IndustryGraphView({
             elements={elements}
             style={{ width: "100%", height: "520px" }}
             cy={(cy: Core) => setCyInstance(cy)}
-            layout={{ name: "cose", animate: false, fit: true, padding: 48 }}
+            layout={graphLayout}
             stylesheet={[
               {
                 selector: "node",
