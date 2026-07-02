@@ -20,6 +20,14 @@ samples/      mock insight_payload 样例
 docs/         接口协议和联调说明
 ```
 
+## 第一周需求
+
+第一周执行清单见：
+
+```text
+docs/第一周需求列表.md
+```
+
 ## 启动 KG 服务
 
 ```powershell
